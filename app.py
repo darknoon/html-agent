@@ -22,11 +22,8 @@ model = "claude-3-5-sonnet-20240620"
 
 
 def prepare_playwright_if_needed():
-    # on linux install chromium with deps
-    if sys.platform.startswith("linux"):
-        os.system("playwright install chromium --with-deps")
-    else:
-        os.system("playwright install chromium")
+    # hopefully, we already installed the deps with dependencies.txt
+    os.system("playwright install chromium")
 
 
 prepare_playwright_if_needed()
