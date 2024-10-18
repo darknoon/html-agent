@@ -8,7 +8,6 @@ import os
 from typing import Literal
 import time
 from base64 import b64encode
-import sys
 
 load_dotenv()
 # check for ANTHROPIC_API_KEY
@@ -24,9 +23,6 @@ model = "claude-3-5-sonnet-20240620"
 def prepare_playwright_if_needed():
     # hopefully, we already installed the deps with dependencies.txt
     os.system("playwright install chromium")
-
-
-prepare_playwright_if_needed()
 
 
 def apply_tailwind(content):
@@ -218,4 +214,5 @@ demo = gr.Interface(
 
 
 if __name__ == "__main__":
+    prepare_playwright_if_needed()
     demo.launch()
