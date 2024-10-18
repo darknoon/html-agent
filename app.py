@@ -1,6 +1,5 @@
 import gradio as gr
-from playwright.async_api import async_playwright, Browser, Page
-import asyncio
+from playwright.async_api import async_playwright, Page
 from PIL import Image
 from io import BytesIO
 from anthropic import Anthropic, TextEvent
@@ -9,7 +8,7 @@ import os
 from typing import Literal
 import time
 from base64 import b64encode
-import json
+import sys
 
 load_dotenv()
 # check for ANTHROPIC_API_KEY
@@ -20,6 +19,17 @@ if os.getenv("ANTHROPIC_API_KEY") is None:
 
 anthropic = Anthropic()
 model = "claude-3-5-sonnet-20240620"
+
+
+def prepare_playwright_if_needed():
+    # on linux install chromium with deps
+    if sys.platform.startswith("linux"):
+        os.system("playwright install chromium --with-deps")
+    else:
+        os.system("playwright install chromium")
+
+
+prepare_playwright_if_needed()
 
 
 def apply_tailwind(content):
