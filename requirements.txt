@@ -2,4 +2,3 @@ gradio
 playwright
 anthropic
 python-dotenv
-
