@@ -2,12 +2,13 @@ import gradio as gr
 from playwright.async_api import async_playwright, Page
 from PIL import Image
 from io import BytesIO
-from anthropic import Anthropic, TextEvent
+from anthropic import Anthropic
 from dotenv import load_dotenv
 import os
 from typing import Literal
 import time
 from base64 import b64encode
+from contextlib import asynccontextmanager
 
 load_dotenv()
 # check for ANTHROPIC_API_KEY
@@ -53,23 +54,25 @@ Assume that the content is being inserted into a template like this:
 {apply_tailwind("your html here")}
 """
 
-improve_prompt = """
-Given the current draft of the webpage you generated for me as HTML and the screenshot of it rendered, improve the HTML to look nicer.
-"""
+
+def messages_text_to_web(prompt):
+    return [
+        {"role": "user", "content": prompt},
+    ]
 
 
-def stream_initial(prompt):
+# returns the full text of the response each time
+def stream_claude(messages, system=system_prompt, max_tokens=2000):
+    text = ""
     with anthropic.messages.stream(
         model=model,
-        max_tokens=2000,
-        system=system_prompt,
-        messages=[
-            {"role": "user", "content": prompt},
-        ],
+        max_tokens=max_tokens,
+        system=system,
+        messages=messages,
     ) as stream:
-        for message in stream:
-            if isinstance(message, TextEvent):
-                yield message.text
+        for chunk in stream.text_stream:
+            text += chunk
+            yield text
 
 
 def format_image(image: bytes, media_type: Literal["image/png", "image/jpeg"]):
@@ -84,13 +87,14 @@ def format_image(image: bytes, media_type: Literal["image/png", "image/jpeg"]):
     }
 
 
-def stream_with_visual_feedback(prompt, history: list[tuple[str, bytes]]):
+def visual_feedback_messages(prompt, history: list[tuple[str, bytes]]):
     """
     history is a list of tuples of (content, image) corresponding to iterations of generation and rendering
     """
-    print(f"History has {len(history)} images")
-
-    messages = [
+    improve_prompt = """
+    Given the current draft of the webpage you generated for me as HTML and the screenshot of it rendered, improve the HTML to look nicer.
+    """
+    return [
         {"role": "user", "content": prompt},
         *[
             item
@@ -118,27 +122,57 @@ def stream_with_visual_feedback(prompt, history: list[tuple[str, bytes]]):
         ],
     ]
 
-    with anthropic.messages.stream(
-        model=model,
-        max_tokens=2000,
-        system=system_prompt,
-        messages=messages,
-    ) as stream:
-        for message in stream:
-            if isinstance(message, TextEvent):
-                yield message.text
+
+def match_image_messages(image_bytes: bytes, history: list[tuple[bytes, bytes]]):
+    improve_prompt = """
+    Given the current draft of the webpage you generated for me as HTML and the original screenshot, improve the HTML to match closer to the original screenshot.
+    """
+
+    return [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "Please generate a webpage that matches the image below as closely as possible:",
+                },
+                format_image(image_bytes, "image/png"),
+            ],
+        },
+        *[
+            item
+            for content, image_bytes in history
+            for item in [
+                {
+                    "role": "assistant",
+                    "content": content,
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "Here is a screenshot of the above HTML code rendered in a browser:",
+                        },
+                        format_image(image_bytes, "image/png"),
+                        {
+                            "type": "text",
+                            "text": improve_prompt,
+                        },
+                    ],
+                },
+            ]
+        ],
+    ]
 
 
 async def render_html(page: Page, content: str):
-    start_time = t()
+    start_time = time.perf_counter()
     await page.set_content(content)
     # weird, can we set scale to 2.0 directly instead of "device", ie whatever server this is running on?
     image_bytes = await page.screenshot(type="png", scale="device", full_page=True)
-    return image_bytes, t() - start_time
-
-
-def t():
-    return time.perf_counter()
+    dt = time.perf_counter() - start_time
+    return image_bytes, dt
 
 
 def apply_template(content, template):
@@ -151,48 +185,78 @@ def to_pil(image_bytes: bytes):
     return Image.open(BytesIO(image_bytes))
 
 
+@asynccontextmanager
+async def browser(width, height):
+    async with async_playwright() as p:
+        browser = await p.chromium.launch()
+        page = await browser.new_page(viewport={"width": width, "height": height})
+        try:
+            yield page
+        finally:
+            await browser.close()
+
+
+async def throttle(generator, every=0.25):
+    last_emit_time = 0
+    for item in generator:
+        current_time = time.perf_counter()
+        if current_time - last_emit_time >= every:
+            yield item
+            last_emit_time = current_time
+    # always emit the last item
+    yield item
+
+
 async def generate_with_visual_feedback(
     prompt,
     template,
     resolution: str = "512",
     num_iterations: int = 1,
 ):
-    render_every = 0.25
-    resolution = {"512": (512, 512), "1024": (1024, 1024)}[resolution]
-    async with async_playwright() as p:
-        browser = await p.chromium.launch()
-        page = await browser.new_page(
-            viewport={"width": resolution[0], "height": resolution[1]}
-        )
-        last_yield = t()
+    width = {"512": 512, "1024": 1024}[resolution]
+    async with browser(width, width) as page:
         history = []
         for i in range(num_iterations):
-            stream = (
-                stream_initial(prompt)
+            messages = (
+                messages_text_to_web(prompt)
                 if i == 0
-                else stream_with_visual_feedback(prompt, history)
+                else visual_feedback_messages(prompt, history)
             )
             content = ""
-            for chunk in stream:
-                content = content + chunk
-                current_time = t()
-                if current_time - last_yield >= render_every:
-                    image_bytes, render_time = await render_html(
-                        page, apply_template(content, template)
-                    )
-                    yield to_pil(image_bytes), content, render_time
-                    last_yield = t()
+            async for content in throttle(stream_claude(messages), every=0.25):
+                image_bytes, render_time = await render_html(
+                    page, apply_template(content, template)
+                )
+                yield to_pil(image_bytes), content, render_time
+            history.append((content, image_bytes))
+
+
+def to_image_bytes(image: Image.Image) -> bytes:
+    buffer = BytesIO()
+    image.save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+async def match_image_with_visual_feedback(image, template, resolution, num_iterations):
+    width = {"512": 512, "1024": 1024}[resolution]
+    async with browser(width, width) as page:
+        history = []
+        for i in range(num_iterations):
+            image.thumbnail((width, width), Image.Resampling.LANCZOS)
+            messages = match_image_messages(to_image_bytes(image), history)
+            async for content in throttle(stream_claude(messages), 0.25):
+                image_bytes, render_time = await render_html(
+                    page, apply_template(content, template)
+                )
+                yield to_pil(image_bytes), content, render_time
             # always render the final image of each iteration
             image_bytes, render_time = await render_html(
                 page, apply_template(content, template)
             )
             history.append((content, image_bytes))
-            yield to_pil(image_bytes), content, render_time
-        # cleanup
-        await browser.close()
 
 
-demo = gr.Interface(
+demo_generate = gr.Interface(
     generate_with_visual_feedback,
     inputs=[
         gr.Textbox(
@@ -210,6 +274,26 @@ demo = gr.Interface(
         gr.Textbox(lines=5, label="Code"),
         gr.Number(label="Render Time", precision=2),
     ],
+)
+
+demo_match_image = gr.Interface(
+    match_image_with_visual_feedback,
+    inputs=[
+        gr.Image(type="pil", label="Original Image", image_mode="RGB", format="png"),
+        gr.Dropdown(choices=["tailwind"], label="Template", value="tailwind"),
+        gr.Dropdown(choices=["512", "1024"], label="Page Width", value="512"),
+        gr.Slider(1, 10, 3, step=1, label="Iterations"),
+    ],
+    outputs=[
+        gr.Image(type="pil", label="Rendered HTML", image_mode="RGB", format="png"),
+        gr.Textbox(lines=5, label="Code"),
+        gr.Number(label="Render Time", precision=2),
+    ],
+)
+
+demo = gr.TabbedInterface(
+    [demo_match_image, demo_generate],
+    ["Match Image", "Generate"],
 )
 
 
