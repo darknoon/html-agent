@@ -2,7 +2,7 @@ import gradio as gr
 from playwright.async_api import async_playwright, Page
 from PIL import Image
 from io import BytesIO
-from anthropic import Anthropic
+from anthropic import Anthropic, APIStatusError
 from dotenv import load_dotenv
 import os
 from typing import Literal
@@ -61,18 +61,39 @@ def messages_text_to_web(prompt):
     ]
 
 
+class MaxRetriesExceeded(Exception):
+    pass
+
+
 # returns the full text of the response each time
-def stream_claude(messages, system=system_prompt, max_tokens=2000):
+def stream_claude(
+    messages,
+    system=system_prompt,
+    max_tokens=2000,
+    max_retries=3,
+    wait_seconds=1,
+    wait_exponential=1.5,
+):
     text = ""
-    with anthropic.messages.stream(
-        model=model,
-        max_tokens=max_tokens,
-        system=system,
-        messages=messages,
-    ) as stream:
-        for chunk in stream.text_stream:
-            text += chunk
-            yield text
+    for _ in range(max_retries):
+        try:
+            with anthropic.messages.stream(
+                model=model,
+                max_tokens=max_tokens,
+                system=system,
+                messages=messages,
+            ) as stream:
+                for chunk in stream.text_stream:
+                    text += chunk
+                    yield text
+                return
+        except APIStatusError as e:
+            # anthropic.APIStatusError: {'type': 'error', 'error': {'details': None, 'type': 'overloaded_error', 'message': 'Overloaded'}}
+            print(
+                f"Error from Claude: {e}, will wait {wait_seconds} seconds before retrying"
+            )
+            wait_seconds *= wait_exponential
+    raise MaxRetriesExceeded
 
 
 def format_image(image: bytes, media_type: Literal["image/png", "image/jpeg"]):
@@ -125,7 +146,7 @@ def visual_feedback_messages(prompt, history: list[tuple[str, bytes]]):
 
 def match_image_messages(image_bytes: bytes, history: list[tuple[bytes, bytes]]):
     improve_prompt = """
-    Given the current draft of the webpage you generated for me as HTML and the original screenshot, improve the HTML to match closer to the original screenshot.
+    Given the current draft of the webpage you generated for me as HTML and the original screenshot, improve the HTML to match closer to the original screenshot. Remember not to output any commentary, just the HTML.
     """
 
     return [
